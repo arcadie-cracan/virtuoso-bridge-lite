@@ -105,6 +105,15 @@ virtuoso-bridge bootstrap --window 0x3000012
 `bootstrap` refuses windows that are not identified as a CIW and does not
 accept arbitrary SKILL text.
 
+### Local-only daemon bind
+
+The daemon binds `0.0.0.0` by default. Set `RB_LOCAL=1` in the environment
+that loads `ramic_bridge.il` (the Virtuoso process, or `setShellEnvVar` before
+`load(...)`) to bind `127.0.0.1` from the first start: the file auto-starts
+the daemon, so assigning `RBLocal` after `load(...)` is too late. SSH tunnels
+reach the daemon on the remote loopback, so a local-only bind is sufficient
+for both local and tunnelled clients.
+
 ### Optional IPC logging
 
 Daemon IPC logging is disabled by default. To enable it, set

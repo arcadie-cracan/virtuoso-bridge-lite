@@ -25,7 +25,10 @@ RBIdentityPath = if(getShellEnvVar("RB_IDENTITY_PATH") then
             else
                 ""
             )
-RBLocal = nil                                                                      ; Local-only connections (127.0.0.1 vs 0.0.0.0)
+; Local-only connections (127.0.0.1 vs 0.0.0.0).  Read from the environment
+; like RB_PORT: this file auto-runs RBStart() below, so a value set after
+; load() would arrive too late for the first bind.  Only "1" enables it.
+RBLocal = getShellEnvVar("RB_LOCAL") == "1"
 RBEcho = nil                                                                     ; Echo bridging messages for debugging
 ; Read IPC logging settings from the Virtuoso process environment at load time.
 ; Only "1" enables logging; a configured path alone does not enable it.
