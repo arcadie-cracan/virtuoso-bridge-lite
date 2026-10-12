@@ -206,6 +206,10 @@ def _start_one_profile(profile: str | None) -> int:
     if SSHClient.is_running(profile):
         msg = "Bridge already running." if is_local else "Tunnel already running."
         print(msg)
+        if is_local:
+            # The setup is in place, but is the daemon behind the port this
+            # workspace's project?  Same check as a fresh start.
+            return _check_local_daemon_project(profile, SSHClient.read_state(profile))
         return 0
 
     label = f" [{profile}]" if profile else ""
@@ -242,7 +246,7 @@ def _start_one_profile(profile: str | None) -> int:
                 setup_path = state.get("setup_path")
                 if setup_path:
                     print(f"  Load in Virtuoso CIW: load(\"{setup_path}\")")
-            return 0
+            return _check_local_daemon_project(profile, state)
 
         if not _wait_for_tunnel_running(profile):
             print("[warning] Tunnel process exited shortly after start.")
@@ -265,6 +269,34 @@ def _start_one_profile(profile: str | None) -> int:
         return 0
     finally:
         ssh.close()
+
+
+def _check_local_daemon_project(profile: str | None, state: dict | None) -> int:
+    """Local mode: a workspace bound to a project (VB_PROJECT) must not report
+    success against the same user's daemon of another project."""
+    from virtuoso_bridge.daemon_guard import check_daemon_project, expected_project
+    from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
+
+    workspace_project = expected_project(profile)
+    if not workspace_project or not state or not state.get("port"):
+        return 0
+    try:
+        vc = VirtuosoClient(host="127.0.0.1", port=int(state["port"]), timeout=5,
+                            log_to_ciw=False, expected_project=workspace_project)
+        vc.daemon_token = _state_or_local_daemon_token(state, profile)
+        check = check_daemon_project(vc, profile=profile, timeout=5)
+    except Exception as exc:
+        print(f"[daemon] project not checked ({exc})")
+        return 0
+    if check.skipped:
+        print(f"[daemon] not reachable yet - start it from the CIW menu "
+              f"({workspace_project} -> Agent Bridge... -> Start)")
+        return 0
+    if not check.ok:
+        _print_project_mismatch(check.error, workspace_project)
+        return 1
+    print(f"[daemon] OK - project {check.daemon_project}")
+    return 0
 
 
 def _wait_for_tunnel_running(profile: str | None, timeout: float = 5.0) -> bool:
@@ -458,9 +490,38 @@ def _print_cross_user_daemon_failure(error: str) -> None:
     print(f"  Set {OVERRIDE_ENV}=1 only if this cross-user connection is intentional.")
 
 
+def _is_project_mismatch(errors: list[str] | None) -> bool:
+    from virtuoso_bridge.daemon_guard import PROJECT_MISMATCH_PREFIX
+
+    return any(PROJECT_MISMATCH_PREFIX in err for err in errors or [])
+
+
+def _print_project_mismatch(error: str, workspace_project: str) -> None:
+    """The daemon behind the port is the same user's session of another project."""
+    print("\n[daemon] PROJECT MISMATCH - refusing another project's Virtuoso session")
+    print(f"  workspace project: {workspace_project}")
+    print(f"  {error}")
+
+
+def _print_daemon_project(vc, workspace_project: str) -> None:
+    fetch = getattr(vc, "daemon_project", None)
+    if not callable(fetch):
+        return
+    try:
+        reported = fetch(timeout=5)
+    except Exception as exc:
+        print(f"  daemon project: unavailable ({exc})")
+        return
+    if reported or workspace_project:
+        print(f"  daemon project: {reported or '(none reported)'}")
+    if workspace_project:
+        print(f"  workspace project: {workspace_project}")
+
+
 def _print_status() -> int:
     _load_cli_env()
     profile = _get_cli_profile()
+    from virtuoso_bridge.daemon_guard import expected_project
     from virtuoso_bridge.transport.tunnel import SSHClient, _is_localhost, _profiled_bridge_leaf
     from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
 
@@ -472,6 +533,7 @@ def _print_status() -> int:
     print(f"  Virtuoso Bridge v{__version__}{label}")
 
     suffix = f"_{profile}" if profile else ""
+    workspace_project = expected_project(profile)
     roles = remote_host_roles_from_os(profile, load=False)
     configured_host = roles.daemon_host or ""
     configured_user = roles.remote_user or ""
@@ -512,8 +574,18 @@ def _print_status() -> int:
 
     if is_local:
         print("\n[mode] local (no SSH tunnel)")
-        if state:
+        if workspace_project:
+            print(f"  project : {workspace_project}")
+        configured_port = os.getenv(f"VB_REMOTE_PORT{suffix}", "").strip()
+        if state and configured_port.isdigit() and str(state.get('port')) != configured_port:
+            # The saved local setup belongs to another workspace of this user
+            # (another project): this workspace's own port is what counts.
+            print(f"  port : {configured_port} (this workspace's .env; the saved local setup "
+                  f"used {state.get('port')} - run `virtuoso-bridge start` here)")
+            state = dict(state, port=int(configured_port))
+        elif state:
             print(f"  port : {state.get('port')}")
+        if state:
             setup_path = state.get("setup_path")
         else:
             setup_path = None
@@ -525,6 +597,8 @@ def _print_status() -> int:
         print(f"  GUI host    : {roles.gui_host or '(not set)'}")
         print(f"  Spectre host: {roles.spectre_host or '(not set)'}")
         print(f"  remote user : {configured_user or '(not set)'}")
+        if workspace_project:
+            print(f"  project     : {workspace_project}")
         if jump_host:
             print(f"  jump host   : {jump_host}")
         if ssh_backend.lower() == "paramiko":
@@ -569,9 +643,15 @@ def _print_status() -> int:
 
             vc = VirtuosoClient(host="127.0.0.1", port=port, timeout=5)
             vc.daemon_token = _state_or_local_daemon_token(state, profile)
+            if workspace_project:
+                vc.expected_project = workspace_project
             probe = vc.execute_skill("1+1", timeout=5)
             ok = probe.status == ExecutionStatus.SUCCESS
-            if not ok and any(
+            mismatch = not ok and _is_project_mismatch(probe.errors)
+            if mismatch:
+                daemon_user_ok = False
+                _print_project_mismatch(probe.errors[0], workspace_project)
+            elif not ok and any(
                 "authentication" in err.lower() for err in probe.errors or []
             ):
                 print(f"\n[daemon] AUTH FAILED - {probe.errors[0]}")
@@ -591,6 +671,7 @@ def _print_status() -> int:
                         _print_cross_user_daemon_failure(user_check.error)
                 except Exception as exc:
                     print(f"  daemon user: unavailable ({exc})")
+                _print_daemon_project(vc, workspace_project)
 
                 try:
                     r = vc.execute_skill(
@@ -624,7 +705,7 @@ def _print_status() -> int:
                     r'printf("\n  [virtuoso-bridge] Status check at %s - connection OK.\n\n" getCurrentTime())',
                     timeout=5,
                 )
-            if not ok and setup_path:
+            if not ok and setup_path and not mismatch:
                 _print_load_hint(setup_path)
                 _print_stale_daemon_hint()
         except Exception as e:
@@ -647,6 +728,10 @@ def _print_status() -> int:
         print(f"  banner host   : {reported_daemon_host}")
         if daemon_identity.get("ip"):
             print(f"  banner IP     : {daemon_identity['ip']}")
+        if daemon_identity.get("project"):
+            print(f"  banner project: {daemon_identity['project']}")
+        if daemon_identity.get("stale"):
+            print(f"  WARNING: identity file is stale ({daemon_identity['stale']})")
         print(f"  tunnel target : {configured_host or '(not set)'}")
         if daemon_endpoint_hostname:
             print(f"  SSH hostname  : {daemon_endpoint_hostname}")
@@ -2458,7 +2543,17 @@ def main(argv: list[str] | None = None) -> int:
             v = getattr(args, k, None)
             if v is not None:
                 _EXPORT_VISIO_OPTS[k] = v
-    return dispatch[args.command]()
+    from virtuoso_bridge.daemon_guard import DaemonProjectError
+
+    try:
+        return dispatch[args.command]()
+    except DaemonProjectError as exc:
+        # The same user's Virtuoso session of another project: refused
+        # before anything ran; say so without a traceback.
+        import sys as _sys
+
+        print(f"ERROR: {exc}", file=_sys.stderr)
+        return 1
 
 
 # Global profile for CLI commands (avoids changing all function signatures)

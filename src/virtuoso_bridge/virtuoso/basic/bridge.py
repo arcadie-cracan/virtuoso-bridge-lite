@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from virtuoso_bridge.env import load_vb_env
-from virtuoso_bridge import daemon_auth
+from virtuoso_bridge import daemon_auth, daemon_guard
 from virtuoso_bridge.profile import resolve_profile
 from virtuoso_bridge.virtuoso.basic.composition import compose_skill_script
 from virtuoso_bridge.models import ExecutionStatus, VirtuosoInterface, VirtuosoResult
@@ -42,18 +42,32 @@ _TUNNEL_CONNECT_RETRY_DELAY = 0.2
 _TUNNEL_CONNECT_GRACE_SECONDS = 3.0
 
 
-def _default_remote_port(username: str | None = None) -> int:
-    """Return a stable per-user default port in the range 65000-65499.
+def _default_remote_port(username: str | None = None, project: str | None = None) -> int:
+    """Return a stable default port for *username* (and *project*).
 
-    SHA-1 based: the previous ``sum(ord(c)) % 500`` assigned identical ports
-    to any anagram pair (and collided often on shared EDA hosts), which made
-    cross-user daemon squatting trivial.  Deployment-time occupancy probing
+    With a project (``VB_PROJECT``; the ETTI flow's CURRENT_PROJECT) the port
+    is per user *and* project: ``61000 + sha1("<user>/<project>")[:8] % 4000``,
+    the value the ETTI project module exports as VIRTUOSO_BRIDGE_PORT, so one
+    user's sessions in two projects never share a port and the CIW server,
+    the agent workspace and this client agree without coordination.
+
+    Without a project the historical per-user port is kept:
+    ``65000 + sha1(user)[:8] % 500``.  SHA-1 based: the previous
+    ``sum(ord(c)) % 500`` assigned identical ports to any anagram pair (and
+    collided often on shared EDA hosts), which made cross-user daemon
+    squatting trivial.  Deployment-time occupancy probing
     (SSHClient.ensure_remote_setup) additionally shifts away ports already
     held by another user.
     """
     user = username or os.getenv("VB_REMOTE_USER", "").strip()
+    if project is None:
+        project = os.getenv(daemon_guard.PROJECT_ENV, "")
+    project = project.strip()
     if not user:
         return 65432
+    if project:
+        digest = hashlib.sha1(f"{user}/{project}".encode("utf-8")).hexdigest()
+        return 61000 + (int(digest[:8], 16) % 4000)
     digest = hashlib.sha1(user.encode("utf-8")).hexdigest()
     return 65000 + (int(digest[:8], 16) % 500)
 
@@ -78,6 +92,23 @@ def _acquire_daemon_token(ssh: Any) -> str | None:
     ):
         return ssh.ensure_daemon_token()
     return daemon_auth.local_token_or_raise()
+
+
+def _local_token_if_local(ssh: Any) -> str | None:
+    """Local mode has no tunnel to warm: read (or create) the local token now,
+    so a command issued before `start` ran in this workspace is still
+    authenticated (the saved local setup may belong to the same user's
+    other project).  Remote mode keeps deferring provisioning to
+    warm()/start, where it travels over SSH."""
+    if (
+        getattr(ssh, "ssh_runner", None) is not None
+        or getattr(ssh, "_ssh_runner", None) is not None
+    ):
+        return None
+    try:
+        return daemon_auth.read_or_create_local_token()
+    except Exception:
+        return None
 
 
 def _escape_skill_string(s: str) -> str:
@@ -112,6 +143,7 @@ class VirtuosoClient(VirtuosoInterface):
         tunnel: Any = None,
         log_to_ciw: bool = True,
         daemon_token: str | None = None,
+        expected_project: str | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -121,6 +153,15 @@ class VirtuosoClient(VirtuosoInterface):
         self._daemon_token = daemon_token
         self._pending_nonce: str | None = None
         self._daemon_caps: dict[str, Any] | None = None
+        # Project this client's workspace is for (VB_PROJECT): when set, a
+        # daemon reporting another project -- the same user's other Virtuoso
+        # session -- is refused before any SKILL runs.
+        self._expected_project = (
+            expected_project.strip() if expected_project is not None
+            else daemon_guard.expected_project(None)
+        )
+        self._daemon_project: str | None = None
+        self._project_checked = False
         self._remote_virtuoso_pid: int | None = None
         self.layout = LayoutOps(self)
         self.library = LibraryOps(self)
@@ -176,7 +217,9 @@ class VirtuosoClient(VirtuosoInterface):
             # The token never lives in state.json (world-readable by
             # design); it is fetched from the daemon host over SSH.
             client = cls(host="127.0.0.1", port=port, timeout=timeout, tunnel=ssh,
-                         log_to_ciw=log_to_ciw, daemon_token=_acquire_daemon_token(ssh))
+                         log_to_ciw=log_to_ciw, daemon_token=_acquire_daemon_token(ssh),
+                         expected_project=daemon_guard.expected_project(profile))
+            client._reject_other_project_daemon_if_reachable(profile=profile, timeout=min(timeout, 10))
             client._reject_cross_user_daemon_if_reachable(profile=profile, timeout=min(timeout, 10))
             return client
 
@@ -191,6 +234,8 @@ class VirtuosoClient(VirtuosoInterface):
             timeout=timeout,
             tunnel=ssh,
             log_to_ciw=log_to_ciw,
+            daemon_token=_local_token_if_local(ssh),
+            expected_project=daemon_guard.expected_project(profile),
         )
 
     @classmethod
@@ -233,6 +278,7 @@ class VirtuosoClient(VirtuosoInterface):
             tunnel=tunnel,
             log_to_ciw=log_to_ciw,
             daemon_token=token,
+            expected_project=daemon_guard.expected_project(getattr(tunnel, "_profile", None)),
         )
         # Remote tunnels only: a local SSHClient has no runner, and local
         # mode has no cross-user exposure over loopback.
@@ -241,6 +287,10 @@ class VirtuosoClient(VirtuosoInterface):
             or getattr(tunnel, "_ssh_runner", None) is not None
         )
         if has_runner:
+            client._reject_other_project_daemon_if_reachable(
+                profile=getattr(tunnel, "_profile", None),
+                timeout=min(timeout, 10),
+            )
             client._reject_cross_user_daemon_if_reachable(
                 profile=getattr(tunnel, "_profile", None),
                 timeout=min(timeout, 10),
@@ -338,6 +388,8 @@ class VirtuosoClient(VirtuosoInterface):
         if value != self._daemon_token:
             # A different secret invalidates any cached handshake result.
             self._daemon_caps = None
+            self._daemon_project = None
+            self._project_checked = False
         self._daemon_token = value
 
     # -- VirtuosoInterface --------------------------------------------------
@@ -397,6 +449,20 @@ class VirtuosoClient(VirtuosoInterface):
                 status=ExecutionStatus.ERROR,
                 errors=[str(e)],
             )
+
+    def _reject_other_project_daemon_if_reachable(
+        self,
+        *,
+        profile: str | None,
+        timeout: int = 5,
+    ) -> None:
+        """Refuse a client whose daemon is the same user's session of another
+        project (VB_PROJECT), with the project message rather than the
+        user check's wrapped one.  Unreachable daemons are skipped.
+        """
+        check = daemon_guard.check_daemon_project(self, profile=profile, timeout=timeout)
+        if not check.ok:
+            raise daemon_guard.DaemonProjectError(check.error)
 
     def _reject_cross_user_daemon_if_reachable(
         self,
@@ -543,6 +609,14 @@ class VirtuosoClient(VirtuosoInterface):
                                  exc, connect_deadline - now)
                     time.sleep(min(_TUNNEL_CONNECT_RETRY_DELAY, connect_deadline - now))
 
+        except daemon_guard.DaemonProjectError as exc:
+            elapsed = time.monotonic() - start_time
+            logger.warning("Daemon project check failed: %s", exc)
+            return VirtuosoResult(
+                status=ExecutionStatus.ERROR,
+                errors=[str(exc)],
+                execution_time=elapsed,
+            )
         except daemon_auth.DaemonAuthError as exc:
             elapsed = time.monotonic() - start_time
             logger.warning("Daemon authentication failed: %s", exc)
@@ -1845,6 +1919,74 @@ let((result winName ciwNum)
         self._daemon_caps = caps
         return caps
 
+    # -- project guard ------------------------------------------------------
+
+    @property
+    def expected_project(self) -> str:
+        """Project this client's workspace is for ("" = unchecked)."""
+        return self._expected_project
+
+    @expected_project.setter
+    def expected_project(self, value: str | None) -> None:
+        value = (value or "").strip()
+        if value != self._expected_project:
+            self._project_checked = False
+        self._expected_project = value
+
+    def _query_daemon_project(self, deadline: float) -> str:
+        """Project of the daemon's Virtuoso session, cached per handshake.
+
+        Read from the signed capabilities when the daemon reports it; older
+        daemons are asked ``getShellEnvVar("CURRENT_PROJECT")`` directly,
+        bypassing the project gate (this query is the gate's input).
+        """
+        if self._daemon_project is not None:
+            return self._daemon_project
+        caps = self._ensure_daemon_capabilities(deadline)
+        reported = caps.get("project")
+        if isinstance(reported, str):
+            self._daemon_project = reported.strip()
+            return self._daemon_project
+        checked = self._project_checked
+        self._project_checked = True
+        try:
+            raw = self._execute_skill_once(
+                'getShellEnvVar("CURRENT_PROJECT")',
+                self._remaining_timeout(deadline),
+                deadline,
+            )
+        finally:
+            self._project_checked = checked
+        if raw.startswith(_NAK):
+            raise RuntimeError(raw[1:].strip() or "daemon project query failed")
+        body = raw[1:] if raw.startswith(_STX) else raw
+        self._daemon_project = daemon_guard.clean_skill_output(body)
+        return self._daemon_project
+
+    def _ensure_daemon_project(self, deadline: float) -> None:
+        """Refuse a daemon of another project before any SKILL runs."""
+        if self._project_checked or not self._expected_project:
+            return
+        reported = self._query_daemon_project(deadline)
+        check = daemon_guard.compare_daemon_project(self._expected_project, reported)
+        if not check.ok:
+            raise daemon_guard.DaemonProjectError(check.error)
+        self._project_checked = True
+
+    def daemon_project(self, timeout: int | None = None) -> str:
+        """Project reported by the reachable daemon ("" when it reports none).
+
+        Raises like the handshake does (connection refused, authentication),
+        so :func:`daemon_guard.check_daemon_project` can classify failures.
+        """
+        budget = timeout if timeout is not None else self._timeout
+        # Fail fast when nothing listens: the handshake would otherwise
+        # retry until the deadline and report a timeout, which callers could
+        # not tell from a daemon that will not identify itself.
+        with socket.create_connection((self._host, self._port), timeout=min(budget, 3)):
+            pass
+        return self._query_daemon_project(time.monotonic() + budget)
+
     def _execute_skill_once(
         self,
         skill_code: str,
@@ -1852,8 +1994,10 @@ let((result winName ciwNum)
         deadline: float,
     ) -> str:
         # Handshake first: authentication failures must never cost an
-        # execution on a foreign or outdated daemon.
+        # execution on a foreign or outdated daemon.  Then the project gate:
+        # the same user's session of another project is refused as well.
         self._ensure_daemon_capabilities(deadline)
+        self._ensure_daemon_project(deadline)
         request_timeout = min(timeout, self._remaining_timeout(deadline))
         payload: dict[str, Any] = {
             "proto": daemon_auth.PROTOCOL_VERSION,
@@ -1878,6 +2022,8 @@ let((result winName ciwNum)
                 # different user (or the token was rotated).  Drop the cached
                 # handshake so a later retry re-negotiates.
                 self._daemon_caps = None
+                self._daemon_project = None
+                self._project_checked = False
                 raise daemon_auth.DaemonAuthError(
                     raw[1:].decode("utf-8", errors="ignore").strip()
                 )

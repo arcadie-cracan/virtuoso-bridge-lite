@@ -155,6 +155,11 @@ The defaults are deployment = GUI and Spectre = legacy/daemon host. The shared
 jump host is suppressed automatically when the target itself is the jump host.
 `status` reads a daemon identity file written from the CIW banner, so it can
 diagnose a daemon/tunnel host mismatch even when the TCP endpoint is wrong.
+The file also records the session's project, Virtuoso PID and working
+directory; a record whose daemon is gone is reported as stale, and the CIW
+loader removes its own record when the daemon exits. With `VB_PROJECT` set,
+a daemon of another project (the same user's other Virtuoso session) is
+refused before any SKILL runs — `status` prints `PROJECT MISMATCH`.
 
 On Windows PowerShell, replace the activation line with
 `.\.venv\Scripts\Activate.ps1`.

@@ -37,6 +37,13 @@ import traceback
 # ---------------------------------------------------------------------------
 TOKEN_PATH_ENV = "RB_TOKEN_PATH"
 ALLOW_UNAUTH_ENV = "RB_ALLOW_UNAUTHENTICATED"
+# Project of the Virtuoso session (ETTI flow): RB_PROJECT, set by the project
+# menu before the daemon starts, else the project module's CURRENT_PROJECT
+# inherited from Virtuoso.  Reported in the hello capabilities and in the
+# banner, so a client refuses the same user's session of another project
+# (daemon_guard.check_daemon_project) instead of silently driving it.
+PROJECT_ENV = "RB_PROJECT"
+PROJECT_FALLBACK_ENV = "CURRENT_PROJECT"
 _PROTO = 1
 _REQ_DOMAIN = "vb1-request"
 _RESP_DOMAIN = "vb1-response"
@@ -72,6 +79,17 @@ def _is_hex_token(text, min_len, max_len):
 
 def _opted_out_of_auth():
     return os.environ.get(ALLOW_UNAUTH_ENV, "").strip().lower() in _TRUTHY
+
+
+def _session_project():
+    for name in (PROJECT_ENV, PROJECT_FALLBACK_ENV):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+SESSION_PROJECT = _session_project()
 
 
 def _harden_perms(path, dir_mode=None, file_mode=None):
@@ -276,6 +294,7 @@ def _capabilities_body():
             "auth": "on" if BRIDGE_TOKEN else "off",
             "daemon": "ramic-bridge",
             "virtuoso_pid": virtuoso_pid,
+            "project": SESSION_PROJECT,
         }
     )
 
@@ -388,6 +407,14 @@ def _safe_close_connection(conn):
         conn.close()
     except OSError:
         pass
+
+def _virtuoso_alive():
+    try:
+        os.kill(virtuoso_pid, 0)
+        return True
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+
 
 def watchdog_callback():
     global timeout_flag
@@ -556,7 +583,7 @@ def start_server():
         # Banner -- SKILL side parses this from stderr to populate
         # RBLastPid / RBLastBind / RBLastHost / RBLastIP for the monitor
         # display.  Format is frozen:
-        #   "[RB-banner] pid=N bind=H:P host=NAME ip=A.B.C.D"
+        #   "[RB-banner] pid=N bind=H:P host=NAME ip=A.B.C.D auth=on|off project=NAME"
         try:
             _hn = socket.gethostname() or "unknown"
         except Exception:
@@ -580,14 +607,28 @@ def start_server():
             except Exception:
                 _ip = ""
         sys.stderr.write(
-            "[RB-banner] pid={pid} bind={host}:{port} host={hn} ip={ip} auth={auth}\n".format(
+            "[RB-banner] pid={pid} bind={host}:{port} host={hn} ip={ip} auth={auth} project={project} virtuoso_pid={vpid}\n".format(
                 pid=os.getpid(), host=HOST, port=PORT, hn=_hn, ip=(_ip or "unknown"),
                 auth=("on" if BRIDGE_TOKEN else "off"),
+                project="_".join(SESSION_PROJECT.split()),
+                vpid=virtuoso_pid,
             )
         )
         sys.stderr.flush()
+        # Virtuoso gone (killed, crashed) means nobody answers our requests
+        # and the port would stay held by an orphan: leave with it.
+        s.settimeout(3.0)
         while True:
-            conn, addr = s.accept()
+            try:
+                conn, addr = s.accept()
+            except socket.timeout:
+                if not _virtuoso_alive():
+                    sys.stderr.write(
+                        "[RB-exit] Virtuoso pid %d is gone; daemon exiting\n" % virtuoso_pid
+                    )
+                    sys.stderr.flush()
+                    sys.exit(0)
+                continue
             try:
                 handle_external_connection(conn, addr)
             except Exception:

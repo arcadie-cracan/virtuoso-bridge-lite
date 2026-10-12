@@ -25,6 +25,12 @@ RBIdentityPath = if(getShellEnvVar("RB_IDENTITY_PATH") then
             else
                 ""
             )
+; Project of this Virtuoso session (ETTI flow): RB_PROJECT, set by the project
+; menu before the daemon starts, else the project module's CURRENT_PROJECT.
+; The daemon inherits both and reports the project in its banner and
+; handshake, so a client can tell this session from the same user's session
+; in another project (daemon_guard.check_daemon_project).
+RBProject = or(getShellEnvVar("RB_PROJECT") getShellEnvVar("CURRENT_PROJECT") "")
 ; Local-only connections (127.0.0.1 vs 0.0.0.0).  Read from the environment
 ; like RB_PORT: this file auto-runs RBStart() below, so a value set after
 ; load() would arrive too late for the first bind.  Only "1" enables it.
@@ -52,6 +58,8 @@ unless(boundp('RBLastPid) RBLastPid = nil)
 unless(boundp('RBLastBind) RBLastBind = "")
 unless(boundp('RBLastHost) RBLastHost = "")
 unless(boundp('RBLastIP) RBLastIP = "")
+unless(boundp('RBLastProject) RBLastProject = "")
+unless(boundp('RBLastVirtuosoPid) RBLastVirtuosoPid = nil)
 
 ; Daemon-reported runtime stats (counter / errors / uptime in seconds).
 ; Updated by RBIpcErrHandler when the daemon emits a [RB-stat] line.
@@ -63,14 +71,37 @@ unless(boundp('RBStatUptime) RBStatUptime = 0)
 ; read this through the deployment/GUI host even when its TCP tunnel points
 ; at the wrong machine, which makes split-host bootstrap failures diagnosable.
 procedure(RBWriteIdentity()
+    ; key=value lines; project/virtuoso_pid/workdir let a reader tell which
+    ; session of the user wrote it, and whether that session is still alive.
     when(RBIdentityPath && strlen(RBIdentityPath) > 0
         errset(
             let((port)
                 port = outfile(RBIdentityPath)
                 when(port
-                    fprintf(port "host=%s\nip=%s\npid=%L\nbind=%s\n"
-                        RBLastHost RBLastIP RBLastPid RBLastBind)
+                    fprintf(port "host=%s\nip=%s\npid=%L\nbind=%s\nproject=%s\nvirtuoso_pid=%L\nworkdir=%s\nstarted=%s\n"
+                        RBLastHost RBLastIP RBLastPid RBLastBind
+                        RBLastProject RBLastVirtuosoPid getWorkingDir() getCurrentTime())
                     close(port)))))
+)
+
+procedure(RBIdentityOwnedp()
+    ; t when the identity file names this session's daemon (pid=RBLastPid).
+    ; A second session of the same project shares the path and must not
+    ; delete the first one's record.
+    let((in line owned)
+        when(RBLastPid && RBIdentityPath && strlen(RBIdentityPath) > 0 && isFile(RBIdentityPath)
+            in = infile(RBIdentityPath)
+            when(in
+                while(gets(line in)
+                    when(equal(line sprintf(nil "pid=%L\n" RBLastPid)) owned = t))
+                close(in)))
+        owned)
+)
+
+procedure(RBRemoveIdentity()
+    ; The daemon is gone: drop the record it wrote, so nothing mistakes it
+    ; for a live daemon.  Only this session's own record is removed.
+    when(RBIdentityOwnedp() errset(deleteFile(RBIdentityPath)))
 )
 
 procedure(RBIpcDataHandler(ipcId data)
@@ -145,17 +176,22 @@ procedure(RBIpcErrHandler(ipcId data)
                 when(strlen(tok) > 5 && equal(substring(tok 1 5) "host=")
                     RBLastHost = substring(tok 6))
                 when(strlen(tok) > 3 && equal(substring(tok 1 3) "ip=")
-                    RBLastIP = substring(tok 4)))
+                    RBLastIP = substring(tok 4))
+                when(strlen(tok) > 8 && equal(substring(tok 1 8) "project=")
+                    RBLastProject = substring(tok 9))
+                when(strlen(tok) > 13 && equal(substring(tok 1 13) "virtuoso_pid=")
+                    RBLastVirtuosoPid = atoi(substring(tok 14))))
             RBWriteIdentity()
             ; First banner of this daemon's lifetime --> announce
             ; "ready" with the populated identity.  RBStart printed
             ; only "launching" earlier; this is the authoritative
             ; startup ack and avoids the pid=nil race window.
             when(RBLastPid && !prevPid
-                printf("[RAMIC Bridge ipc=%L %s pid=%L] ready: bind=%s log=%s\n"
+                printf("[RAMIC Bridge ipc=%L %s pid=%L] ready: bind=%s project=%s log=%s\n"
                     ipcId
                     sprintf(nil "%s (%s)" RBLastIP RBLastHost)
                     RBLastPid RBLastBind
+                    if(strlen(RBLastProject) > 0 RBLastProject "(none)")
                     if(RBDLog RBLogPath "off")))
             ; Banner is the canonical "daemon just identified itself"
             ; event -- repaint the monitor so users don't have to hit
@@ -173,6 +209,7 @@ procedure(RBIpcFinishHandler(ipcId data)
     when(exitStatus != 0 && strlen(RBStderrBuf) > 0
         printf("[RAMIC Bridge stderr]\n%s\n" RBStderrBuf))
     RBStderrBuf = ""
+    RBRemoveIdentity()
     ; Daemon is gone -- repaint the monitor so it shows Down without
     ; the user having to click Refresh.
     when(boundp('RBMonInstalled) errset(RBMRefresh()))
@@ -211,6 +248,8 @@ procedure(RBStart()
         RBLastBind = ""
         RBLastHost = ""
         RBLastIP = ""
+        RBLastProject = ""
+        RBLastVirtuosoPid = nil
         RBStatCount = 0
         RBStatErrors = 0
         RBStatUptime = 0)
@@ -228,6 +267,8 @@ procedure(RBStart()
         RBLastBind = ""
         RBLastHost = ""
         RBLastIP = ""
+        RBLastProject = ""
+        RBLastVirtuosoPid = nil
         RBStatCount = 0
         RBStatErrors = 0
         RBStatUptime = 0
@@ -296,6 +337,8 @@ procedure(RBStopAll()
     RBLastPid = nil
     RBLastHost = ""
     RBLastIP = ""
+    RBLastProject = ""
+    RBLastVirtuosoPid = nil
     RBStatCount = 0
     RBStatErrors = 0
     RBStatUptime = 0

@@ -7,6 +7,7 @@ localhost:port TCP endpoint; SSHClient makes that endpoint available.
 
 from __future__ import annotations
 
+import getpass
 import importlib.resources
 import json
 import logging
@@ -40,6 +41,9 @@ from virtuoso_bridge.transport.ssh import (
 logger = logging.getLogger(__name__)
 
 _TUNNEL_STARTUP_SETTLE_SECONDS = 1.0
+# key=value lines of daemon_identity.txt (written by ramic_bridge.il from the
+# daemon banner; project/virtuoso_pid/workdir/started since 0.8.0+etti.2).
+_IDENTITY_KEYS = frozenset({"host", "ip", "pid", "bind", "project", "virtuoso_pid", "workdir", "started"})
 
 
 def _pid_is_alive(pid: Any) -> bool:
@@ -333,12 +337,21 @@ class SSHClient:
         backend_env = ssh_backend_env_from_os(profile)
         ssh_proxy_url = ssh_proxy_url_from_os(profile)
 
-        # Port
+        # Port: VB_REMOTE_PORT, else derived from the user and VB_PROJECT
+        from virtuoso_bridge.daemon_guard import expected_project
         from virtuoso_bridge.virtuoso.basic.bridge import _default_remote_port
+
+        port_user = remote_user or ""
+        if not port_user and _is_localhost(remote_host):
+            try:
+                port_user = getpass.getuser()
+            except Exception:
+                port_user = ""
+        project = expected_project(profile)
         try:
-            port = int(os.getenv(f"VB_REMOTE_PORT{suffix}", "").strip() or _default_remote_port(remote_user))
+            port = int(os.getenv(f"VB_REMOTE_PORT{suffix}", "").strip() or _default_remote_port(port_user, project))
         except (ValueError, TypeError):
-            port = _default_remote_port(remote_user)
+            port = _default_remote_port(port_user, project)
 
         # Local port (defaults to remote port if not set)
         local_port_str = os.getenv(f"VB_LOCAL_PORT{suffix}", "").strip()
@@ -991,9 +1004,32 @@ class SSHClient:
         identity: dict[str, str] = {}
         for line in text.splitlines():
             key, separator, value = line.partition("=")
-            if separator and key in {"host", "ip", "pid", "bind"}:
+            if separator and key in _IDENTITY_KEYS:
                 identity[key] = value.strip()
+        # A record whose daemon is gone (session closed or crashed) must not
+        # pass for a live daemon: flag it so status says so.
+        for key, what in (("pid", "daemon"), ("virtuoso_pid", "Virtuoso")):
+            pid = identity.get(key, "")
+            if pid.isdigit() and self._daemon_pid_alive(int(pid)) is False:
+                identity["stale"] = f"{what} pid {pid} is not running"
+                break
         return identity
+
+    def _daemon_pid_alive(self, pid: int) -> bool | None:
+        """Liveness of *pid* on the daemon host (None when it cannot be told)."""
+        if _is_localhost(self._daemon_host):
+            return _pid_is_alive(pid)
+        try:
+            result = self._require_runner().run_command(
+                f"kill -0 {int(pid)} 2>/dev/null && echo ALIVE || echo DEAD",
+                timeout=min(self._timeout, 10),
+            )
+        except Exception:
+            return None
+        lines = (result.stdout or "").strip().splitlines()
+        if not lines:
+            return None
+        return lines[-1].strip() != "DEAD"
 
     # -- state file ---------------------------------------------------------
 
@@ -1048,7 +1084,10 @@ class SSHClient:
         if not state:
             return False
         if state.get("mode") == "local":
-            return True
+            # The saved local setup is per user, not per workspace: when this
+            # workspace's .env names another port (the same user's other
+            # project), the setup is stale here and `start` must redo it.
+            return cls._local_state_matches_env(state, profile)
         if state.get("mode") != "remote":
             return False
         port = state.get("port")
@@ -1067,6 +1106,19 @@ class SSHClient:
         if local_port <= 0 or not _pid_is_alive(pid):
             return False
         return SSHRunner.can_reach_port(local_port)
+
+    @staticmethod
+    def _local_state_matches_env(state: dict[str, Any], profile: str | None) -> bool:
+        """True unless VB_REMOTE_PORT[_<profile>] names another port than the saved
+        local setup (then it belongs to another workspace of this user)."""
+        suffix = f"_{profile}" if profile else ""
+        configured = os.getenv(f"VB_REMOTE_PORT{suffix}", "").strip()
+        if not configured.isdigit():
+            return True
+        try:
+            return int(state.get("port")) == int(configured)
+        except (TypeError, ValueError):
+            return False
 
     # -- file transfer (delegated to SSHRunner) -----------------------------
 

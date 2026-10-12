@@ -1,4 +1,4 @@
-"""Small daemon identity guard for cross-user Virtuoso sessions.
+"""Daemon identity guards: cross-user and cross-project Virtuoso sessions.
 
 The remote daemon port is a host-wide, first-come-first-served resource: any
 user's Virtuoso on the same machine can end up listening on the port our SSH
@@ -277,3 +277,123 @@ def check_daemon_user(
             ),
         )
     return DaemonUserCheck(ok=True, expected_user=expected, daemon_user=daemon_user)
+
+
+# ---------------------------------------------------------------------------
+# Project guard: the same user's sessions in different projects
+# ---------------------------------------------------------------------------
+#
+# On the ETTI flow every project module exports CURRENT_PROJECT, each project
+# gets its own bridge port, and the project menu starts the daemon with
+# RB_PROJECT.  The daemon reports that project in its signed handshake (older
+# daemons: ``getShellEnvVar("CURRENT_PROJECT")`` in Virtuoso).  A workspace
+# declares the project it is for with ``VB_PROJECT[_<profile>]``; a reachable
+# daemon of another project is refused before any SKILL runs.  It is the same
+# user, so the token and the user check cannot tell the sessions apart.
+
+PROJECT_ENV = "VB_PROJECT"
+PROJECT_MISMATCH_PREFIX = "daemon project mismatch"
+
+
+class DaemonProjectError(RuntimeError):
+    """The reachable daemon belongs to another project's Virtuoso session."""
+
+
+@dataclass(frozen=True)
+class DaemonProjectCheck:
+    ok: bool
+    expected_project: str = ""
+    daemon_project: str = ""
+    error: str = ""
+    # True when no daemon answered (nothing to compare; re-verified later).
+    skipped: bool = False
+
+
+def expected_project(profile: str | None) -> str:
+    """Project this workspace is for: ``VB_PROJECT[_<profile>]``.
+
+    Empty means unchecked (setups without projects, or a workspace that is
+    not bound to one).
+    """
+    suffix = f"_{profile}" if profile else ""
+    value = os.getenv(f"{PROJECT_ENV}{suffix}", "").strip()
+    if not value and suffix:
+        value = os.getenv(PROJECT_ENV, "").strip()
+    return value
+
+
+def compare_daemon_project(expected: str, reported: str | None) -> DaemonProjectCheck:
+    """Decide whether a daemon reporting *reported* may serve *expected*."""
+    expected = (expected or "").strip()
+    reported = (reported or "").strip()
+    if not expected:
+        return DaemonProjectCheck(ok=True, daemon_project=reported)
+    if not reported:
+        return DaemonProjectCheck(
+            ok=False,
+            expected_project=expected,
+            error=(
+                f"{PROJECT_MISMATCH_PREFIX}: the daemon did not report a project, "
+                f"but this workspace is for {expected!r}. The Virtuoso session was "
+                f"not started from a project module (or its bridge predates "
+                f"project identity); refusing a session that cannot be confirmed"
+            ),
+        )
+    if reported != expected:
+        return DaemonProjectCheck(
+            ok=False,
+            expected_project=expected,
+            daemon_project=reported,
+            error=(
+                f"{PROJECT_MISMATCH_PREFIX}: the daemon belongs to your {reported!r} "
+                f"Virtuoso session, but this workspace is for {expected!r}. Start "
+                f"the Agent Bridge in the {expected} session ({expected} menu -> "
+                f"Agent Bridge... -> Start) and make sure VB_REMOTE_PORT/VB_LOCAL_PORT "
+                f"are that project's port ({expected} menu -> Agent Client Setup...)"
+            ),
+        )
+    return DaemonProjectCheck(ok=True, expected_project=expected, daemon_project=reported)
+
+
+def query_daemon_project(client: Any, *, timeout: int = 5) -> str:
+    """Project of the daemon's Virtuoso session ("" when it reports none).
+
+    From the signed handshake when the daemon reports it, else from
+    ``getShellEnvVar("CURRENT_PROJECT")`` in Virtuoso.  Raises when the
+    daemon does not answer.
+    """
+    fetch = getattr(client, "daemon_project", None)
+    if callable(fetch):
+        return (fetch(timeout=timeout) or "").strip()
+    return _run_skill(client, 'getShellEnvVar("CURRENT_PROJECT")', timeout)
+
+
+def check_daemon_project(
+    client: Any,
+    *,
+    profile: str | None,
+    timeout: int = 5,
+) -> DaemonProjectCheck:
+    """Verify the reachable daemon belongs to this workspace's project.
+
+    Never raises: an unreachable daemon produces ``ok=True, skipped=True``;
+    a daemon that answers but reports no project, another project, or that
+    cannot be queried produces ``ok=False`` with ``error``.
+    """
+    expected = expected_project(profile)
+    if not expected:
+        return DaemonProjectCheck(ok=True)
+    try:
+        reported = query_daemon_project(client, timeout=timeout)
+    except Exception as exc:
+        if classify_daemon_query_failure(str(exc)) == "not_loaded":
+            return DaemonProjectCheck(ok=True, expected_project=expected, skipped=True)
+        return DaemonProjectCheck(
+            ok=False,
+            expected_project=expected,
+            error=(
+                f"{PROJECT_MISMATCH_PREFIX}: could not determine the project of the "
+                f"daemon ({exc}); refusing a session that cannot be confirmed"
+            ),
+        )
+    return compare_daemon_project(expected, reported)

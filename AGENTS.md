@@ -46,6 +46,12 @@ collide). The remote port is host-global — whoever binds it first owns it — 
 free one if another user's process already holds it (the choice is written
 back to `.env`).
 Re-running `init` on an existing `.env` is a no-op; pass `--force` to overwrite.
+With `VB_PROJECT=<name>` (ETTI flow: the project module's `CURRENT_PROJECT`)
+the default port is per user **and project** (`61000 + sha1(user/project) % 4000`,
+the port the project module exports as `VIRTUOSO_BRIDGE_PORT`), and `start`,
+`status` and every command refuse a daemon that reports another project: the
+same user's Virtuoso session in another project is otherwise indistinguishable
+(same token, same user, same host).
 
 **2. Edit `.env`** (only if step 1 did not already fill it in)
 
